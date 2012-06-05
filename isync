@@ -1,0 +1,268 @@
+#!/usr/bin/env python2
+
+import gpod
+import os
+import posixpath
+import sys
+
+from stat import *
+from optparse import OptionParser
+from hashlib import sha256
+
+def file_hash(filename):
+    """Return an SHA256 hash on the first 16k of a file."""
+    import struct
+    # only hash the first 16k
+    hash_len = 4*4096
+    hash = sha256()
+    size = os.path.getsize(filename)
+    hash.update(struct.pack("<L", size))
+    hash.update(open(filename).read(hash_len))
+    return hash.hexdigest()
+
+class collection(object):
+    def __init__(self):
+        self.art = dict()
+        self.media = dict()
+        self.stale = list()
+        self.noart = list()
+
+    def __repr__(self):
+        return '<collection art:{0.art!r} media:{0.media!r}>'.format(self)
+
+class isync(object):
+    def __init__(self, opt):
+        self.opt = opt
+        self.__db = None
+        self.__music_dir = gpod.itdb_get_music_dir(self.opt.mountpoint)
+
+    @property
+    def db(self):
+        if self.__db is None:
+            print '[+] Loading iPod database...'
+            self.__db = gpod.Database(self.opt.mountpoint)
+        return self.__db
+
+    def initialise(self, name):
+        print '[+] Initialising iPod [{1}] at {0}'.format(self.opt.mountpoint, name)
+        if itdb_init_ipod(self.opt.mountpoint, None, name):
+            print "[+] Success"
+            return 0
+        else:
+            print "[-] Failed"
+            return 1
+
+    def ls(self):
+        for t in self.db.get_master():
+            print '{1:<30} {0[size]:>10} {0[filetype]:<20} {0[artist]} - {0[title]}'.format(t, t.ipod_filename())
+        return 0
+
+    def info(self):
+        dev = gpod.itdb_device_new()
+        gpod.itdb_device_set_mountpoint(dev, self.opt.mountpoint)
+        info = gpod.itdb_device_get_ipod_info(dev)
+        print '{0} [{1}] {2} GB'.format(gpod.itdb_info_get_ipod_model_name_string(info.ipod_model), \
+                                        info.model_number, info.capacity)
+        gpod.itdb_device_free(dev)
+
+    def __scan_path(self, *paths):
+        rv = collection()
+        media = list()
+        for path in paths:
+            sys.stdout.write('[+] Scanning {0}...'.format(path))
+            sys.stdout.flush()
+            for root, dirs, files in os.walk(path):
+                for f in files:
+                    if f == 'cover.jpg':
+                        rv.art[root] = f
+                    if f.endswith(('.mp3', '.mp4')):
+                        media.append((root, f))
+                sys.stdout.write('\r[+] Scanning {0}... {1} media file(s) found'.format(path, len(media)))
+                sys.stdout.flush()
+            sys.stdout.write('\n')
+        sys.stdout.write('[+] Hashing media files...')
+        sys.stdout.flush()
+        i = 0
+        for f in media:
+            full = posixpath.join(*f)
+            rv.media[file_hash(full)] = f
+            i += 1
+            sys.stdout.write('\r[+] Hashing media files... {0}/{1}'.format(i, len(media)))
+            sys.stdout.flush()
+        sys.stdout.write('\n')
+        return rv
+
+    def __scan_database(self, hashes):
+        rv = collection()
+        plst = self.db.get_master()
+        print '[+] Mapping database tracks...'
+        for t in plst:
+            fn = t.ipod_filename()
+            if fn and hashes.has_key(fn):
+                rv.media[hashes[fn]] = t
+            else:
+                rv.stale.append(t)
+            if not t.get_coverart():
+                rv.noart.append((t, hashes.get(fn, None)))
+        return rv
+
+    def copy_progress(self, db, track, i, n):
+        sys.stdout.write('\r[+] Copying files to iPod... {0}/{1}'.format(i, n))
+        sys.stdout.flush()
+
+    def filetype(self, filename):
+        # TODO: support for audiobooks, movies, etc...
+        if filename.endswith('.mp4'):
+            return gpod.ITDB_MEDIATYPE_MUSICVIDEO
+        else:
+            return gpod.ITDB_MEDIATYPE_AUDIO
+
+    def sync(self, *paths):
+        local = self.__scan_path(*paths)
+        ipod = self.__scan_path(self.__music_dir)
+
+        ihash = dict((posixpath.join(*v), k) for k, v in ipod.media.iteritems())
+        database = self.__scan_database(ihash)
+
+        noart = list()
+        for i in database.noart:
+            media = None
+            if i[1]:
+                media = local.media.get(i[1], None)
+            noart.append((i[0], media))
+
+        print '[+] Computing changesets...'
+        lh = set(local.media.keys())
+        ih = set(ipod.media.keys())
+        dh = set(database.media.keys())
+
+        orphaned = [posixpath.join(*ipod.media[t]) for t in ih - dh]
+        old = [database.media[t] for t in dh - lh]
+        new = [(local.media[t], os.stat(posixpath.join(*local.media[t]))) for t in lh - dh]
+
+        old = sorted(old, key = lambda t: t['time_modified'])
+        new = sorted(new, key = lambda t: t[1].st_mtime)
+
+        if orphaned:
+            print '[+] Unlinking {0} orphaned file(s)...'.format(len(orphaned))
+            for o in orphaned:
+                try:
+                    if not self.opt.dryrun:
+                        os.unlink(o)
+                    if self.opt.verbose:
+                        print 'unlinked {0}'.format(o)
+                except:
+                    print 'failed to unlink {0}'.format(o)
+
+        if database.stale:
+            print '[+] Removing {0} stale item(s) from database...'.format(len(database.stale))
+            for s in database.stale:
+                if self.opt.verbose:
+                    print 'stale: {0[artist]} - {0[album]} - {0[title]}'.format(s)
+                if not self.opt.dryrun:
+                    try:
+                        self.db.remove(s, quiet = not self.opt.verbose)
+                    except DatabaseException as e:
+                        print '[-] %s' % e
+
+        if old and self.opt.delete:
+            print '[+] Removing {0} old item(s) from database...'.format(len(old))
+            for o in old:
+                if self.opt.verbose:
+                    print 'old: {0[artist]} - {0[album]} - {0[title]}'.format(o)
+                if not self.opt.dryrun:
+                    try:
+                        self.db.remove(o, quiet = not self.opt.verbose)
+                    except DatabaseException as e:
+                        print '[-] %s' % e
+
+        if new:
+            print '[+] Adding {0} new item(s) to database...'.format(len(new))
+            for n in new:
+                if self.opt.verbose:
+                    print 'new: {0}'.format(posixpath.join(*n[0]))
+                media = n[0]
+                try:
+                    if not self.opt.dryrun:
+                        t = self.db.new_Track(filename = posixpath.join(*media), \
+                                              mediatype = self.filetype(media[1]))
+                        noart.append((t, media))
+                except DatabaseException as e:
+                    print '[-] %s' % e
+
+            sys.stdout.write('[+] Copying files to iPod...')
+            sys.stdout.flush()
+            if not self.opt.dryrun:
+                self.db.copy_delayed_files(self.copy_progress)
+            sys.stdout.write('\n')
+
+        found_art = 0
+        if noart:
+            print '[+] Checking {0} item(s) without thumbnails...'.format(len(noart))
+            for n in noart:
+                media = n[1]
+                art = None
+                if media:
+                    art = local.art.get(media[0], None)
+                if art:
+                    art = posixpath.join(media[0], art);
+                    if self.opt.verbose:
+                        print 'setting cover: {0}'.format(art)
+                    if not self.opt.dryrun:
+                        n[0].set_coverart_from_file(art)
+                    found_art += 1
+                elif self.opt.verbose:
+                    print 'no cover for: {0[artist]} - {0[album]}'.format(n[0])
+            if found_art:
+                print '[+] Updated thumbnails for {0}/{1} item(s)'.format(found_art, len(noart))
+
+        if database.stale or old or new or found_art:
+            print '[+] Saving and closing iPod database...'
+            if not self.opt.dryrun:
+                self.db.close()
+
+        print '[+] Synchronisation successful'
+
+        return 0
+
+# TODO: - interactive shell with completion :)
+#       - caching of hash tables (to avoid re-hashing)
+#       - simple "add" operation that avoids scanning completely
+#       - use primitives that avoid the gtkpod ext db (faster?)
+if __name__ == '__main__':
+    usage = "Usage: %prog [options] cmd [args]"
+
+    parser = OptionParser(add_help_option = False, usage = usage)
+
+    parser.add_option('-m', '--mountpoint', dest='mountpoint', help='iPod mount point [default: %default]',
+                                            default='/mnt/ipod', metavar='PATH')
+    # TODO:
+    ## parser.add_option('-a', '--ask',        dest='ask',        help='ask before performing write actions',
+    ##                                         default=False, action='store_true')
+    parser.add_option(      '--dry-run',    dest='dryrun',     help='do not perform any write actions',
+                                            default=False, action='store_true')
+    parser.add_option(      '--delete',     dest='delete',     help='delete files from iPod',
+                                            default=False, action='store_true')
+    parser.add_option('-v', '--verbose',    dest='verbose',    help='show verbose output',
+                                            default=False, action='store_true')
+    parser.add_option('-h', '--help',       dest='help',     help='show this help message', 
+                                            default=False, action='store_true')
+
+    (opt, args) = parser.parse_args()
+
+    if opt.help or not args:
+        parser.print_help()
+        print '''
+Commands:
+  info                  display device info
+  ls                    list iPod contents
+  initialise <name>     initialise device (deletes all tracks)
+  sync [paths]          synchronise device with paths
+'''
+        sys.exit(0)
+
+    try:
+        sys.exit(getattr(isync(opt), args.pop(0))(*args))
+    except Exception as e:
+        print '[-] %s' % e
+        sys.exit(2)
