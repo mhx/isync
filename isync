@@ -1,8 +1,11 @@
 #!/usr/bin/env python2
 
 import gpod
+import mutagen
+import eyeD3.mp3
 import os
 import posixpath
+import struct
 import sys
 
 from stat import *
@@ -19,6 +22,113 @@ def file_hash(filename):
     hash.update(struct.pack("<L", size))
     hash.update(open(filename).read(hash_len))
     return hash.hexdigest()
+
+class gapless(object):
+    CHUNK_SIZE = 8192
+    FRAME_HEADER_SIZE = 4
+    MIN_FRAME_SIZE = 21
+    MIN_FRAMES = 8
+    LAME_TAG_SIZE = 0x24
+
+    class mp3header(object):
+        def __init__(self, data, offset):
+            self.valid = False
+            self.offset = offset
+            if len(data) == 4:
+                b = struct.unpack('4B', data)
+                self.version = (b[1] >> 3) & 1 if b[1] & 0x10 else 2
+                if (b[0] << 4) | ((b[1] & 0xE0) >> 4) == 0xFFE and (b[1] >> 1) & 3 in (0, 1):
+                    self._bitrate = (b[2] >> 4) & 0x0F
+                    self._freq = (b[2] >> 2) & 0x3
+                    self.padding = (b[2] >> 1) & 0x1
+                    self.mode = (b[3] >> 6) & 0x3
+                    self.length = 72000*((self.version & 1) + 1)*self.bitrate/self.frequency + self.padding
+                    if self.length >= gapless.MIN_FRAME_SIZE:
+                        self.valid = True
+
+        @property
+        def bitrate(self):
+            return ((0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0), \
+                    (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0))[self.version & 1][self._bitrate]
+
+        @property
+        def frequency(self):
+            return ((22050, 24000, 16000, 50000), \
+                    (44100, 48000, 32000, 50000), \
+                    (11025, 12000,  8000, 50000))[self.version][self._freq]
+
+    def __seek_sync(self):
+        data = self.__fp.read(gapless.CHUNK_SIZE)
+        while data:
+            sync = data.find('\xff')
+            if sync >= 0:
+                self.__fp.seek(sync - gapless.CHUNK_SIZE, os.SEEK_CUR)
+                return True
+            data = self.__fp.read(gapless.CHUNK_SIZE)
+        return False
+
+    def __get_header(self):
+        pos = self.__fp.tell()
+        return gapless.mp3header(self.__fp.read(gapless.FRAME_HEADER_SIZE), pos)
+
+    def __seek_first_header(self):
+        while self.__seek_sync():
+            h = self.__get_header()
+            if h.valid:
+                return h
+        return None
+
+    def __seek_next_header(self, header):
+        self.__fp.seek(header.length - gapless.FRAME_HEADER_SIZE, os.SEEK_CUR)
+        return self.__get_header()
+
+    def __read_lame_tag(self, header):
+        offset = header.offset + ((21, 13), (36, 21))[header.version & 0x1][(header.mode >> 1) & 0x1]
+        self.__fp.seek(offset, os.SEEK_SET)
+        id = self.__fp.read(4)
+        if id not in ('Xing', 'Info'):
+            return False
+        flags = struct.unpack('>I', self.__fp.read(4))[0]
+        skip = 0
+        if flags & 0x1:
+            skip += 4
+        if flags & 0x2:
+            skip += 4
+        if flags & 0x4:
+            skip += 100
+        if flags & 0x8:
+            skip += 4
+        self.__fp.seek(skip, os.SEEK_CUR)
+        lame = self.__fp.read(gapless.LAME_TAG_SIZE)
+        if len(lame) != gapless.LAME_TAG_SIZE or not lame.startswith('LAME'):
+            return False
+        b = struct.unpack('{0}B'.format(gapless.LAME_TAG_SIZE), lame)
+        self.pregap = (b[0x15] << 4) + (b[0x16] >> 4)
+        self.postgap = ((b[0x16] & 0xf) << 8) + b[0x17]
+        return True
+
+    def __init__(self, filename):
+        self.valid = 0
+        self.__fp = open(filename)
+        headers = list()
+        h = self.__seek_first_header()
+        while h and h.valid:
+            headers.append(h)
+            h = self.__seek_next_header(h)
+        if len(headers) > gapless.MIN_FRAMES:
+            if self.__read_lame_tag(headers[0]):
+                self.valid = 1
+                self.gapless_data = sum([i.length for i in headers[:-8]])
+                self.samplecount = (len(headers) - 1)*(576, 1152)[headers[0].version & 1] - self.pregap - self.postgap
+
+    def __repr__(self):
+        return '<gapless valid:{0.valid!r} pregap:{0.pregap!r} postgap:{0.postgap!r} gapless_data:{0.gapless_data!r} samplecount:{0.samplecount!r}>'.format(self)
+
+class metadata(object):
+    def __init__(self, filename):
+        self.__m = mutagen.File(filename, easy = True)
+        for k, v in self.__m.iteritems():
+            setattr(self, k, v[0])
 
 class collection(object):
     def __init__(self):
@@ -110,12 +220,57 @@ class isync(object):
         sys.stdout.write('\r[+] Copying files to iPod... {0}/{1}'.format(i, n))
         sys.stdout.flush()
 
-    def filetype(self, filename):
+    def __mediatype(self, filename):
         # TODO: support for audiobooks, movies, etc...
         if filename.endswith('.mp4'):
             return gpod.ITDB_MEDIATYPE_MUSICVIDEO
         else:
             return gpod.ITDB_MEDIATYPE_AUDIO
+
+    def repair(self):
+        fixed_mediatype = 0
+        fixed_gapless = [0, 0]
+        print '[+] Checking database for problems'
+        for t in self.db.get_master():
+            fn = t.ipod_filename()
+            mt = self.__mediatype(fn)
+            if not mt == t['mediatype']:
+                if self.opt.verbose:
+                    print 'wrong mediatype for {0}: {1} -> {2}'.format(fn, t['mediatype'], mt)
+                if not self.opt.dryrun:
+                    t['mediatype'] = mt
+                fixed_mediatype += 1
+            if not t['gapless_track_flag']:
+                fixed_gapless[1] += 1
+                if self.opt.verbose:
+                    print 'no gapless information for {0}: {1} - {2}'.format(fn, t['artist'], t['title'])
+                gl = gapless(fn)
+                if gl.valid:
+                    if not self.opt.dryrun:
+                        t['gapless_track_flag'] = 1
+                        t['pregap'] = gl.pregap
+                        t['postgap'] = gl.postgap
+                        t['samplecount'] = gl.samplecount
+                        t['gapless_data'] = gl.gapless_data
+                    fixed_gapless[0] += 1
+        if fixed_mediatype or fixed_gapless:
+            if fixed_mediatype:
+                print '[+] Fixed {0} item(s) with wrong mediatype'.format(fixed_mediatype)
+            if fixed_gapless:
+                print '[+] Fixed {0}/{1} item(s) without gapless information'.format(*fixed_gapless)
+            print '[+] Saving and closing iPod database...'
+            if not self.opt.dryrun:
+                self.db.close()
+        else:
+            print '[+] No problems detected'
+        return 0
+
+    def dump(self):
+        for t in self.db.get_master():
+            print '-----------------------------------------'
+            for k, v in t.iteritems():
+                print '{0} = {1!r}'.format(k, v)
+        return 0
 
     def sync(self, *paths):
         local = self.__scan_path(*paths)
@@ -183,9 +338,22 @@ class isync(object):
                     print 'new: {0}'.format(posixpath.join(*n[0]))
                 media = n[0]
                 try:
+                    fn = posixpath.join(*media)
+                    m = metadata(fn)
                     if not self.opt.dryrun:
-                        t = self.db.new_Track(filename = posixpath.join(*media), \
-                                              mediatype = self.filetype(media[1]))
+                        t = self.db.new_Track(filename = fn)
+                        t['mediatype'] = self.__mediatype(media[1])
+                        for attr in ['title', 'artist', 'album', 'genre']:
+                            v = getattr(m, attr, None)
+                            if v:
+                                t[attr] = v
+                        gl = gapless(fn)
+                        if gl.valid:
+                            t['gapless_track_flag'] = 1
+                            t['pregap'] = gl.pregap
+                            t['postgap'] = gl.postgap
+                            t['samplecount'] = gl.samplecount
+                            t['gapless_data'] = gl.gapless_data
                         noart.append((t, media))
                 except DatabaseException as e:
                     print '[-] %s' % e
@@ -229,6 +397,8 @@ class isync(object):
 #       - caching of hash tables (to avoid re-hashing)
 #       - simple "add" operation that avoids scanning completely
 #       - use primitives that avoid the gtkpod ext db (faster?)
+#       - duplicates detection
+#       - generate preview image from videos?
 if __name__ == '__main__':
     usage = "Usage: %prog [options] cmd [args]"
 
@@ -257,6 +427,7 @@ Commands:
   info                  display device info
   ls                    list iPod contents
   initialise <name>     initialise device (deletes all tracks)
+  repair                try to repair certain database problems
   sync [paths]          synchronise device with paths
 '''
         sys.exit(0)
